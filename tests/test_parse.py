@@ -89,3 +89,10 @@ def test_error_result_marks_spawn_as_failed_with_reason(tmp_path):
     s = t.spawns[0]
     assert s.child_agent_id is None
     assert s.error.startswith("Concurrent subagent limit reached")
+
+
+def test_synthetic_placeholder_messages_are_not_calls(tmp_path):
+    lines = [assistant_line("m1", "claude-sonnet-5", usage(out=5)),
+             assistant_line("s1", "<synthetic>", usage())]
+    t = parse_transcript(write_jsonl(tmp_path / "p.jsonl", lines))
+    assert [c.model for c in t.calls] == ["claude-sonnet-5"]

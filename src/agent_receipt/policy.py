@@ -6,6 +6,8 @@ from dataclasses import dataclass, field, fields
 from fnmatch import fnmatch
 from pathlib import Path
 
+from .parse import Usage
+from .pricing import Price, price_for
 from .tree import AgentNode, failure_summary
 
 
@@ -18,6 +20,14 @@ class Policy:
     flag_resolved_mismatch: bool = True
     flag_missing_transcript: bool = True
     flag_failed_spawns: bool = True
+    prices: dict[str, dict] = field(default_factory=dict)   # [prices."pattern"] input/cache_write/cache_read/output
+
+    def price_for(self, model: str) -> Price | None:
+        return price_for(model, self.prices)
+
+    def cost_of(self, model: str, usage: Usage) -> float | None:
+        price = self.price_for(model)
+        return price.cost(usage) if price else None
 
     def is_cheap(self, model: str) -> bool:
         return any(fnmatch(model, pattern) for pattern in self.cheap_models)

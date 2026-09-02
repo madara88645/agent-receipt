@@ -89,3 +89,17 @@ def test_json_report_includes_failed_spawns():
     tree.children[0].failed_spawns = [Spawn("a", "tu1", "w", "fork", None, "", error="boom")]
     data = json.loads(render_json(tree, [], Policy(), session_label="s"))
     assert data["tree"]["children"][0]["failed_spawns"] == [{"description": "w", "subagent_type": "fork", "error": "boom"}]
+
+
+def test_text_report_shows_dollar_cost_per_node_and_total():
+    text = render_text(_tree(), [], Policy(), session_label="s")
+    assert "Estimated cost: $" in text and "subagents $" in text
+    tree_line = [l for l in text.splitlines() if "main session" in l][0]
+    assert "$" in tree_line
+
+
+def test_json_report_carries_cost_fields():
+    data = json.loads(render_json(_tree(), [], Policy(), session_label="s"))
+    assert isinstance(data["cost"], float) and data["cost"] > 0
+    assert data["subagent_cost"] <= data["cost"] and data["unpriced_calls"] == 0
+    assert "cost" in data["tree"] and all("cost" in r for r in data["totals"].values())

@@ -154,6 +154,8 @@ def parse_transcript(path: Path | str) -> Transcript:
         timestamp = str(line.get("timestamp") or "")
 
         if role == "assistant":
+            if message.get("model") == "<synthetic>":
+                continue      # Claude Code placeholder, not an API call
             message_id = str(message.get("id") or line.get("uuid") or "")
             usage = Usage.from_api(message.get("usage"))
             existing = calls_by_id.get(message_id)

@@ -7,6 +7,7 @@ from dataclasses import asdict
 
 from .parse import Usage
 from .policy import Finding, Policy
+from .pricing import fmt_usd
 from .tree import AgentNode, failure_summary
 
 _MAX_EXAMPLES_PER_RULE = 5
@@ -20,7 +21,19 @@ def fmt_tokens(n: int) -> str:
     return f"{n / 1_000_000:.1f}M"
 
 
-def _totals_by_model(nodes: list[AgentNode]) -> dict[str, dict[str, int]]:
+def node_cost(node: AgentNode, policy: Policy) -> tuple[float, int]:
+    """Priced dollars for the node's own calls, plus how many calls had no known price."""
+    total, unpriced = 0.0, 0
+    for call in node.calls:
+        c = policy.cost_of(call.model, call.usage)
+        if c is None:
+            unpriced += 1
+        else:
+            total += c
+    return total, unpriced
+
+
+def _totals_by_model(nodes: list[AgentNode], policy: Policy) -> dict[str, dict]:
     calls: Counter = Counter()
     usage: dict[str, Usage] = defaultdict(Usage)
     for node in nodes:
@@ -29,7 +42,7 @@ def _totals_by_model(nodes: list[AgentNode]) -> dict[str, dict[str, int]]:
             usage[call.model] = usage[call.model] + call.usage
     return {
         model: {"calls": calls[model], "input": u.input, "cache_create": u.cache_create,
-                "cache_read": u.cache_read, "output": u.output}
+                "cache_read": u.cache_read, "output": u.output, "cost": policy.cost_of(model, u)}
         for model, u in sorted(usage.items(), key=lambda kv: -kv[1].output)
     }
 
@@ -56,19 +69,19 @@ def _model_column(node: AgentNode) -> str:
     return "ran " + ", ".join(f"{m} x{n}" for m, n in models.most_common())
 
 
-def _usage_cells(u: Usage, calls: int) -> str:
+def _usage_cells(u: Usage, calls: int, cost: float | None) -> str:
     return (f"{calls:>4} calls  out {fmt_tokens(u.output):>6}  read {fmt_tokens(u.cache_read):>6}"
-            f"  write {fmt_tokens(u.cache_create):>6}")
+            f"  write {fmt_tokens(u.cache_create):>6}  {fmt_usd(cost):>8}")
 
 
-def _tree_lines(node: AgentNode, flagged: set[str | None], prefix: str = "", is_last: bool = True,
+def _tree_lines(node: AgentNode, flagged: set[str | None], policy: Policy, prefix: str = "", is_last: bool = True,
                 is_root: bool = True) -> list[str]:
     connector = "" if is_root else ("└── " if is_last else "├── ")
     mark = "  !" if node.agent_id in flagged else ""
     orphan = "  (parent unknown)" if not node.parent_known else ""
     desc = node.description if node.depth else "main session"
     line = (f"{prefix}{connector}{desc[:40]:<40} {node.subagent_type:<15} {_model_column(node):<44} "
-            f"{_usage_cells(node.usage(), len(node.calls))}{mark}{orphan}")
+            f"{_usage_cells(node.usage(), len(node.calls), _cost_or_none(node, policy))}{mark}{orphan}")
     lines = [line.rstrip()]
     child_prefix = "" if is_root else prefix + ("    " if is_last else "│   ")
     if node.failed_spawns:
@@ -77,8 +90,22 @@ def _tree_lines(node: AgentNode, flagged: set[str | None], prefix: str = "", is_
         lines.append(f"{child_prefix}{bar}! {n} spawn attempt{'s' if n != 1 else ''} failed: "
                      f"{failure_summary(node.failed_spawns)}")
     for i, child in enumerate(node.children):
-        lines += _tree_lines(child, flagged, child_prefix, i == len(node.children) - 1, is_root=False)
+        lines += _tree_lines(child, flagged, policy, child_prefix, i == len(node.children) - 1, is_root=False)
     return lines
+
+
+def _cost_or_none(node: AgentNode, policy: Policy) -> float | None:
+    cost, unpriced = node_cost(node, policy)
+    return None if unpriced and not cost else cost
+
+
+def session_cost(nodes: list[AgentNode], policy: Policy) -> tuple[float, int]:
+    total, unpriced = 0.0, 0
+    for n in nodes:
+        c, u = node_cost(n, policy)
+        total += c
+        unpriced += u
+    return total, unpriced
 
 
 def render_text(root: AgentNode, findings: list[Finding], policy: Policy, session_label: str) -> str:
@@ -88,19 +115,24 @@ def render_text(root: AgentNode, findings: list[Finding], policy: Policy, sessio
     out: list[str] = []
     out.append(f"agent-receipt · session {session_label}   {_time_range(root)}".rstrip())
     out.append("")
-    out += _tree_lines(root, flagged)
+    out += _tree_lines(root, flagged, policy)
     out.append("")
 
-    def totals_block(title: str, rows: dict[str, dict[str, int]]) -> None:
+    def totals_block(title: str, rows: dict[str, dict]) -> None:
         out.append(title)
         if not rows:
             out.append("  (none)")
         for model, r in rows.items():
             out.append(f"  {model:<24} {r['calls']:>5} calls  out {fmt_tokens(r['output']):>7}"
-                       f"  read {fmt_tokens(r['cache_read']):>7}  write {fmt_tokens(r['cache_create']):>7}")
+                       f"  read {fmt_tokens(r['cache_read']):>7}  write {fmt_tokens(r['cache_create']):>7}"
+                       f"  {fmt_usd(r['cost']):>9}")
 
-    totals_block("Totals by model (whole session):", _totals_by_model(nodes))
-    totals_block("Totals by model (subagents only):", _totals_by_model([n for n in nodes if n.depth]))
+    totals_block("Totals by model (whole session):", _totals_by_model(nodes, policy))
+    totals_block("Totals by model (subagents only):", _totals_by_model([n for n in nodes if n.depth], policy))
+    cost, unpriced = session_cost(nodes, policy)
+    sub_cost, _ = session_cost([n for n in nodes if n.depth], policy)
+    unpriced_note = f" ({unpriced} calls on unpriced models)" if unpriced else ""
+    out.append(f"Estimated cost: {fmt_usd(cost)} · subagents {fmt_usd(sub_cost)}{unpriced_note}")
     out.append("")
     limit_agents = policy.max_agents or "none"
     failed_total = sum(len(n.failed_spawns) for n in nodes)
@@ -125,7 +157,7 @@ def render_text(root: AgentNode, findings: list[Finding], policy: Policy, sessio
     return "\n".join(out) + "\n"
 
 
-def _node_dict(node: AgentNode) -> dict:
+def _node_dict(node: AgentNode, policy: Policy) -> dict:
     u = node.usage()
     return {
         "agent_id": node.agent_id,
@@ -139,25 +171,31 @@ def _node_dict(node: AgentNode) -> dict:
         "calls": len(node.calls),
         "models": dict(node.models()),
         "usage": {"input": u.input, "cache_create": u.cache_create, "cache_read": u.cache_read, "output": u.output},
+        "cost": _cost_or_none(node, policy),
         "started": node.started,
         "ended": node.ended,
         "failed_spawns": [{"description": s.description, "subagent_type": s.subagent_type, "error": s.error}
                           for s in node.failed_spawns],
-        "children": [_node_dict(c) for c in node.children],
+        "children": [_node_dict(c, policy) for c in node.children],
     }
 
 
 def render_json(root: AgentNode, findings: list[Finding], policy: Policy, session_label: str) -> str:
     nodes = list(root.walk())
+    cost, unpriced = session_cost(nodes, policy)
+    sub_cost, _ = session_cost([n for n in nodes if n.depth], policy)
     data = {
         "session": session_label,
         "agents": root.subtree_agents(),
         "max_depth": max(n.depth for n in nodes),
         "failed_spawn_attempts": sum(len(n.failed_spawns) for n in nodes),
-        "totals": _totals_by_model(nodes),
-        "subagent_totals": _totals_by_model([n for n in nodes if n.depth]),
+        "cost": cost,
+        "subagent_cost": sub_cost,
+        "unpriced_calls": unpriced,
+        "totals": _totals_by_model(nodes, policy),
+        "subagent_totals": _totals_by_model([n for n in nodes if n.depth], policy),
         "findings": [asdict(f) for f in findings],
         "policy": asdict(policy),
-        "tree": _node_dict(root),
+        "tree": _node_dict(root, policy),
     }
     return json.dumps(data, indent=2)

@@ -48,3 +48,27 @@ def test_missing_session_is_a_usage_error(tmp_path, capsys):
     code = main([str(tmp_path / "nope.jsonl"), "--claude-home", str(tmp_path)])
     assert code == 2
     assert "not found" in capsys.readouterr().err.lower()
+
+
+def test_hook_mode_writes_receipt_and_never_fails(tmp_path, capsys, monkeypatch):
+    import io
+    path = _session(tmp_path, child_model="claude-fable-5-1")   # has a finding
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"transcript_path": str(path), "hook_event_name": "SessionEnd"})))
+    assert main(["--hook", "--claude-home", str(tmp_path / "home")]) == 0
+    err = capsys.readouterr().err
+    assert "1 agents" in err and "$" in err and "2 findings" in err
+    written = tmp_path / "home" / "agent-receipt" / f"{path.stem}.txt"
+    assert written.exists() and "heavy-model" in written.read_text()
+
+
+def test_hook_mode_swallows_bad_input(tmp_path, capsys, monkeypatch):
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("not json"))
+    assert main(["--hook", "--claude-home", str(tmp_path)]) == 0
+    assert "agent-receipt hook:" in capsys.readouterr().err
+
+
+def test_print_hook_config_is_valid_json(capsys):
+    assert main(["--print-hook-config"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["hooks"]["SessionEnd"][0]["hooks"][0]["command"] == "agent-receipt --hook"
