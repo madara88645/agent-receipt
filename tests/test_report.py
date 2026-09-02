@@ -103,3 +103,26 @@ def test_json_report_carries_cost_fields():
     assert isinstance(data["cost"], float) and data["cost"] > 0
     assert data["subagent_cost"] <= data["cost"] and data["unpriced_calls"] == 0
     assert "cost" in data["tree"] and all("cost" in r for r in data["totals"].values())
+
+
+def test_text_report_shows_duration_tools_and_main_vs_subagent_ratio():
+    from agent_receipt.report import fmt_duration
+    assert (fmt_duration(None), fmt_duration(42_000), fmt_duration(252_000), fmt_duration(3_720_000)) == ("-", "42s", "4m12s", "1h02m")
+    tree = _tree()
+    tree.children[0].spawn_duration_ms = 252_000
+    tree.children[0].spawn_tool_calls = 18
+    text = render_text(tree, [], Policy(), session_label="s")
+    line = [l for l in text.splitlines() if "Mine pain points" in l][0]
+    assert "4m12s" in line and "18 tools" in line
+    assert "main session $" in text and "x the main session" in text
+
+
+def test_reported_cost_cross_check_line():
+    tree = _tree()
+    tree.reported_cost_usd = 0.5
+    tree.reported_model_usage = {"claude-haiku-4-5": {"costUSD": 0.2}, "claude-sonnet-5": {"costUSD": 0.3}}
+    text = render_text(tree, [], Policy(), session_label="s")
+    assert "Claude Code's own figure for this session: $0.50" in text and "our estimate" in text
+    assert "claude-haiku-4-5" in text and "never appears in the transcripts" in text
+    data = json.loads(render_json(tree, [], Policy(), session_label="s"))
+    assert data["reported_cost"] == 0.5

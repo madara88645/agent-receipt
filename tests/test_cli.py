@@ -92,3 +92,22 @@ def test_child_transcript_under_a_sibling_session_dir_is_found(tmp_path, capsys)
     (child,) = data["tree"]["children"]
     assert child["has_transcript"] and child["children"][0]["has_transcript"]
     assert not any(f["rule"] == "missing-transcript" for f in data["findings"])
+
+
+def test_workflow_agents_are_loaded_from_the_run_directory(tmp_path, capsys):
+    from helpers import meta_json, workflow_result_line, workflow_tool_use
+    sid = "33333333-3333-3333-3333-333333333333"
+    write_jsonl(tmp_path / f"{sid}.jsonl", [
+        assistant_line("m1", "claude-fable-5-1", usage(out=10), content=[workflow_tool_use("tw1", "fan out")]),
+        workflow_result_line("tw1", "wf_run-1", name="fanout")])
+    d = tmp_path / sid / "subagents" / "workflows" / "wf_run-1"
+    for aid, model in (("w1", "claude-sonnet-5"), ("w2", "claude-opus-5")):
+        write_jsonl(d / f"agent-{aid}.jsonl", [assistant_line(f"{aid}-1", model, usage(out=5), agent_id=aid)])
+        meta_json(d / f"agent-{aid}.meta.json", agentType="workflow-subagent", spawnDepth=1, model="sonnet")
+    code = main([str(tmp_path / f"{sid}.jsonl"), "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert code == 1 and data["agents"] == 2
+    (wf,) = data["tree"]["children"]
+    assert wf["kind"] == "workflow" and wf["workflow_id"] == "wf_run-1"
+    assert {c["agent_id"]: c["requested_model"] for c in wf["children"]} == {"w1": "sonnet", "w2": "sonnet"}
+    assert [f["rule"] for f in data["findings"]] == ["heavy-model"]     # w2 ran opus although sonnet was asked

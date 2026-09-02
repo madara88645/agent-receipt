@@ -6,6 +6,7 @@ The encoded cwd replaces every character outside ``[A-Za-z0-9-]`` with ``-``.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,28 @@ def session_files(main: Path) -> SessionFiles:
     sub_dir = main.parent / main.stem / "subagents"
     subagents = sorted(sub_dir.glob("agent-*.jsonl")) if sub_dir.is_dir() else []
     return SessionFiles(session_id=main.stem, main=main, subagents=subagents)
+
+
+def workflow_agent_files(main: Path, run_id: str, transcript_dir: str | None = None) -> list[Path]:
+    """Agents launched by the Workflow tool live under <session>/subagents/workflows/<run_id>/."""
+    main = Path(main)
+    candidates = [main.parent / main.stem / "subagents" / "workflows" / run_id]
+    if transcript_dir:
+        candidates.insert(0, Path(transcript_dir).expanduser())
+    for d in candidates:
+        if d.is_dir():
+            return sorted(p for p in d.glob("agent-*.jsonl") if p.is_file())
+    return []
+
+
+def read_meta(agent_file: Path) -> dict:
+    """The agent-<id>.meta.json next to a transcript: agentType, model, spawnDepth, isFork, ..."""
+    meta = Path(agent_file).with_suffix(".meta.json")
+    try:
+        data = json.loads(meta.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def find_agent_transcript(main: Path, agent_id: str) -> Path | None:

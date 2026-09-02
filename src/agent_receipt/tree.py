@@ -5,7 +5,9 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from .parse import Call, Spawn, Transcript, Usage
+from .parse import Call, Spawn, Transcript, Usage, WorkflowRun
+
+_MISSING = object()
 
 
 @dataclass
@@ -18,9 +20,20 @@ class AgentNode:
     depth: int = 0
     has_transcript: bool = True
     parent_known: bool = True
+    kind: str = "agent"                  # agent | workflow | workflow-agent
+    workflow_id: str | None = None
+    spawn_duration_ms: int | None = None # reported by the launcher when the child finished
+    spawn_tool_calls: int | None = None
+    tool_stats: dict[str, int] = field(default_factory=dict)
+    tool_calls: Counter = field(default_factory=Counter)   # from the agent's own transcript
     calls: list[Call] = field(default_factory=list)
     children: list["AgentNode"] = field(default_factory=list)
-    failed_spawns: list[Spawn] = field(default_factory=list)   # Agent calls that returned an error
+    failed_spawns: list[Spawn] = field(default_factory=list)
+    reported_cost_usd: float | None = None   # root only: Claude Code's own cost-state figure
+    reported_model_usage: dict[str, dict] = field(default_factory=dict)   # root only
+    session_id: str | None = None            # root only
+    continued_from: list[str] = field(default_factory=list)   # root only
+    spawn_session_id: str | None = None      # session id of the line that launched this node
 
     def models(self) -> Counter:
         return Counter(call.model for call in self.calls)
@@ -38,7 +51,8 @@ class AgentNode:
         return total
 
     def subtree_agents(self) -> int:
-        return sum(1 + child.subtree_agents() for child in self.children)
+        """Agents below this node; a workflow container is not itself an agent."""
+        return sum((0 if child.kind == "workflow" else 1) + child.subtree_agents() for child in self.children)
 
     def walk(self) -> Iterator["AgentNode"]:
         yield self
@@ -55,17 +69,39 @@ class AgentNode:
         stamps = [c.timestamp for c in self.calls if c.timestamp]
         return max(stamps) if stamps else ""
 
+    @property
+    def duration_ms(self) -> int | None:
+        """Launcher-reported wall clock when available, else the span of the agent's own calls."""
+        if self.spawn_duration_ms is not None:
+            return self.spawn_duration_ms
+        return _span_ms(self.started, self.ended)
 
-_MISSING = object()
+    @property
+    def tool_call_count(self) -> int | None:
+        if self.tool_calls:
+            return sum(self.tool_calls.values())
+        return self.spawn_tool_calls
 
 
-def failure_summary(spawns: list[Spawn], width: int = 90) -> str:
-    """'reason (x3), other reason (x1)' with the most frequent reason first."""
-    counts = Counter(s.error or "unknown error" for s in spawns)
+def _span_ms(start: str, end: str) -> int | None:
+    if not start or not end:
+        return None
+    from datetime import datetime
+    try:
+        a = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        b = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0, int((b - a).total_seconds() * 1000))
+
+
+def failure_summary(spawns: list[Spawn]) -> str:
+    """'reason (x3), other reason (x1)' with the most common reason first."""
+    reasons = Counter((s.error or "unknown error") for s in spawns)
     parts = []
-    for reason, n in counts.most_common():
-        reason = reason if len(reason) <= width else reason[: width - 1] + "…"
-        parts.append(f"{reason} (x{n})")
+    for reason, n in reasons.most_common():
+        short = reason if len(reason) <= 90 else reason[:89] + "…"
+        parts.append(f"{short} (x{n})")
     return ", ".join(parts)
 
 
@@ -80,7 +116,7 @@ def _resolve_claims(spawns: list[Spawn], settled: set[str] = frozenset()) -> dic
     parent's spawn records (including its own launch and its siblings'); those copies are
     dropped because the claimant is itself a child of another claimant. And a copy taken
     before the result arrived has no child id; it is dropped when a resolved copy of the
-    same tool use exists anywhere, or when that tool use is known to have failed (``settled``).
+    same tool use exists anywhere (``settled`` adds tool uses known to have failed).
     """
     resolved_tool_uses = {s.tool_use_id for s in spawns if s.child_agent_id} | set(settled)
     candidates: dict[str, list[Spawn]] = defaultdict(list)
@@ -105,14 +141,13 @@ def _resolve_claims(spawns: list[Spawn], settled: set[str] = frozenset()) -> dic
                        for other in claimants)
         ]
         pool = kept or group
-        # one record per parent is enough; earliest wins
         pool.sort(key=lambda s: (s.timestamp, s.tool_use_id))
         chosen[key] = pool[0]
     return chosen
 
 
 def _is_descendant(agent: str | None, ancestor: str | None, parent_of: dict[str, str | None]) -> bool:
-    seen: set[str | None] = set()
+    seen: set[str] = set()
     while agent is not None and agent not in seen:
         seen.add(agent)
         parent = parent_of.get(agent, _MISSING)
@@ -125,46 +160,84 @@ def _is_descendant(agent: str | None, ancestor: str | None, parent_of: dict[str,
 
 
 def _assign_failed(failed: list[Spawn], parent_of: dict[str, str | None]) -> dict[str | None, list[Spawn]]:
-    """Credit every failed Agent call to exactly one parent.
-
-    A fork inherits its parent's history, so the fork's file re-states the parent's failed
-    attempts under the fork's own id. Among the claimants of one tool use, any claimant that
-    descends from another claimant is a copy and is dropped.
-    """
+    """Credit each failed tool use once, to the claimant that is not descended from another
+    claimant (a fork re-states its parent's failed attempts too)."""
     by_tool_use: dict[str, list[Spawn]] = defaultdict(list)
-    for spawn in failed:
-        by_tool_use[spawn.tool_use_id].append(spawn)
-    credited: dict[str | None, list[Spawn]] = defaultdict(list)
+    for s in failed:
+        by_tool_use[s.tool_use_id].append(s)
+    result: dict[str | None, list[Spawn]] = defaultdict(list)
     for group in by_tool_use.values():
         claimants = {s.parent_agent_id for s in group}
-        kept = [
-            s for s in group
-            if not any(other != s.parent_agent_id and _is_descendant(s.parent_agent_id, other, parent_of)
-                       for other in claimants)
-        ]
+        kept = [s for s in group
+                if not any(other != s.parent_agent_id and _is_descendant(s.parent_agent_id, other, parent_of)
+                           for other in claimants)]
         pool = kept or group
         pool.sort(key=lambda s: (s.timestamp, s.tool_use_id))
-        credited[pool[0].parent_agent_id].append(pool[0])
-    for group in credited.values():
+        result[pool[0].parent_agent_id].append(pool[0])
+    for group in result.values():
         group.sort(key=lambda s: (s.timestamp, s.tool_use_id))
-    return credited
+    return result
 
 
-def build_tree(main: Transcript, subagents: list[Transcript]) -> AgentNode:
-    by_id: dict[str, Transcript] = {t.agent_id: t for t in subagents if t.agent_id}
-    all_spawns = list(main.spawns) + [s for t in subagents for s in t.spawns]
+def _node_from_transcript(node: AgentNode, transcript: Transcript | None) -> AgentNode:
+    if transcript is not None:
+        node.calls = list(transcript.calls)
+        node.tool_calls = Counter(transcript.tool_calls)
+    return node
+
+
+def carried_over(root: AgentNode) -> tuple[list[Call], list[AgentNode]]:
+    """Main calls and top-level children that a continued session inherited from an earlier one."""
+    own = root.session_id
+    if not own or not root.continued_from:
+        return [], []
+    calls = [c for c in root.calls if c.session_id and c.session_id != own]
+    children = [c for c in root.children if c.spawn_session_id and c.spawn_session_id != own]
+    return calls, children
+
+
+def prune_carried_over(root: AgentNode) -> AgentNode:
+    """A copy of the tree with only what this session itself did (for multi-session totals)."""
+    from copy import copy
+    calls, children = carried_over(root)
+    if not calls and not children:
+        return root
+    pruned = copy(root)
+    drop = {id(c) for c in calls}
+    pruned.calls = [c for c in root.calls if id(c) not in drop]
+    dropped = {id(c) for c in children}
+    pruned.children = [c for c in root.children if id(c) not in dropped]
+    return pruned
+
+
+def build_tree(main: Transcript, subagents: list[Transcript],
+               workflows: list[tuple[WorkflowRun, list[tuple[Transcript, dict]]]] | None = None) -> AgentNode:
+    """``workflows`` pairs each Workflow run with its agents' (transcript, meta.json) list."""
+    workflows = workflows or []
+    wf_agents = [t for _, pairs in workflows for t, _ in pairs]
+    by_id: dict[str, Transcript] = {t.agent_id: t for t in [*subagents, *wf_agents] if t.agent_id}
+    all_spawns = list(main.spawns) + [s for t in [*subagents, *wf_agents] for s in t.spawns]
     failed = [s for s in all_spawns if s.error is not None]
-    chosen = _resolve_claims([s for s in all_spawns if s.error is None],
-                             settled={s.tool_use_id for s in failed})
-    failed_of = _assign_failed(failed, {key: spawn.parent_agent_id for key, spawn in chosen.items()})
+    chosen = _resolve_claims([s for s in all_spawns if s.error is None], settled={s.tool_use_id for s in failed})
+    parent_of = {key: spawn.parent_agent_id for key, spawn in chosen.items()}
+    for run, pairs in workflows:
+        for t, _ in pairs:
+            if t.agent_id:
+                parent_of.setdefault(t.agent_id, run.parent_agent_id)
+    failed_of = _assign_failed(failed, parent_of)
 
     children_of: dict[str | None, list[tuple[str, Spawn]]] = defaultdict(list)
     for key, spawn in chosen.items():
         children_of[spawn.parent_agent_id].append((key, spawn))
     for group in children_of.values():
         group.sort(key=lambda item: (item[1].timestamp, item[1].tool_use_id))
+    workflows_of: dict[str | None, list] = defaultdict(list)
+    for run, pairs in workflows:
+        workflows_of[run.parent_agent_id].append((run, pairs))
 
-    root = AgentNode(agent_id=None, calls=list(main.calls), failed_spawns=list(failed_of.get(None, [])))
+    root = AgentNode(agent_id=None, calls=list(main.calls), tool_calls=Counter(main.tool_calls),
+                     failed_spawns=list(failed_of.get(None, [])), reported_cost_usd=main.reported_cost_usd,
+                     reported_model_usage=dict(main.reported_model_usage), session_id=main.session_id, continued_from=list(main.continued_from))
     visited: set[str] = set()
 
     def attach(node: AgentNode) -> None:
@@ -181,11 +254,41 @@ def build_tree(main: Transcript, subagents: list[Transcript]) -> AgentNode:
                 resolved_model=spawn.resolved_model,
                 depth=node.depth + 1,
                 has_transcript=transcript is not None,
-                calls=list(transcript.calls) if transcript else [],
+                spawn_duration_ms=spawn.duration_ms,
+                spawn_tool_calls=spawn.tool_calls,
+                tool_stats=dict(spawn.tool_stats),
+                spawn_session_id=spawn.session_id,
                 failed_spawns=list(failed_of.get(spawn.child_agent_id, [])) if spawn.child_agent_id else [],
             )
-            node.children.append(child)
+            node.children.append(_node_from_transcript(child, transcript))
             attach(child)
+        for run, pairs in workflows_of.get(node.agent_id, []):
+            wf = AgentNode(
+                agent_id=run.run_id or f"workflow:{run.tool_use_id}",
+                description=f"workflow {run.name}".strip() if run.name else (run.description or "workflow"),
+                subagent_type="workflow",
+                depth=node.depth + 1,
+                kind="workflow",
+                workflow_id=run.run_id,
+                has_transcript=bool(pairs),
+                spawn_session_id=run.session_id,
+            )
+            node.children.append(wf)
+            for transcript, meta in pairs:
+                if transcript.agent_id:
+                    visited.add(transcript.agent_id)
+                agent = AgentNode(
+                    agent_id=transcript.agent_id,
+                    description=str(meta.get("description") or transcript.first_prompt or run.description or "(workflow agent)"),
+                    subagent_type=str(meta.get("agentType") or "workflow-subagent"),
+                    requested_model=meta.get("model") if isinstance(meta.get("model"), str) else None,
+                    depth=wf.depth,                   # same spawn depth as the workflow itself
+                    kind="workflow-agent",
+                    workflow_id=run.run_id,
+                    failed_spawns=list(failed_of.get(transcript.agent_id, [])) if transcript.agent_id else [],
+                )
+                wf.children.append(_node_from_transcript(agent, transcript))
+                attach(agent)
 
     attach(root)
 
@@ -198,9 +301,8 @@ def build_tree(main: Transcript, subagents: list[Transcript]) -> AgentNode:
             description="(parent unknown)",
             depth=1,
             parent_known=False,
-            calls=list(transcript.calls),
             failed_spawns=list(failed_of.get(agent_id, [])),
         )
-        root.children.append(orphan)
+        root.children.append(_node_from_transcript(orphan, transcript))
         attach(orphan)
     return root

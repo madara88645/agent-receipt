@@ -21,6 +21,8 @@ class Policy:
     flag_missing_transcript: bool = True
     flag_failed_spawns: bool = True
     prices: dict[str, dict] = field(default_factory=dict)   # [prices."pattern"] input/cache_write/cache_read/output
+    max_agent_cost: float = 0.0             # USD per subagent, 0 = no limit
+    max_session_cost: float = 0.0           # USD for the whole session, 0 = no limit
 
     def price_for(self, model: str) -> Price | None:
         return price_for(model, self.prices)
@@ -100,6 +102,21 @@ def evaluate(root: AgentNode, policy: Policy) -> list[Finding]:
                 "missing-transcript", node.agent_id,
                 f"{_label(node)}: spawned but no transcript file was found"))
 
+    if policy.max_agent_cost:
+        for node in root.walk():
+            if node.depth == 0 or node.kind == "workflow":
+                continue
+            cost = sum((policy.cost_of(c.model, c.usage) or 0.0) for c in node.calls)
+            if cost > policy.max_agent_cost:
+                findings.append(Finding(
+                    "over-budget", node.agent_id,
+                    f"{_label(node)}: cost ${cost:.2f} exceeds the per-agent budget of ${policy.max_agent_cost:.2f}"))
+    if policy.max_session_cost:
+        session = sum((policy.cost_of(c.model, c.usage) or 0.0) for n in root.walk() for c in n.calls)
+        if session > policy.max_session_cost:
+            findings.append(Finding(
+                "over-budget", None,
+                f"session cost ${session:.2f} exceeds the budget of ${policy.max_session_cost:.2f}"))
     total = root.subtree_agents()
     if policy.max_agents and total > policy.max_agents:
         findings.append(Finding(

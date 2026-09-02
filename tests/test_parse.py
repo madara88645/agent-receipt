@@ -96,3 +96,52 @@ def test_synthetic_placeholder_messages_are_not_calls(tmp_path):
              assistant_line("s1", "<synthetic>", usage())]
     t = parse_transcript(write_jsonl(tmp_path / "p.jsonl", lines))
     assert [c.model for c in t.calls] == ["claude-sonnet-5"]
+
+
+def test_finished_agent_result_gives_duration_and_tool_counts(tmp_path):
+    lines = [assistant_line("m1", "claude-sonnet-5", usage(), content=[agent_tool_use("tu_1", "X")]),
+             agent_result_line("tu_1", "kid", resolved_model="claude-sonnet-5",
+                               finished=dict(duration_ms=4200, tool_calls=7, tool_stats={"readCount": 5, "bashCount": 2}))]
+    s = parse_transcript(write_jsonl(tmp_path / "p.jsonl", lines)).spawns[0]
+    assert (s.status, s.duration_ms, s.tool_calls, s.tool_stats) == ("completed", 4200, 7, {"readCount": 5, "bashCount": 2})
+
+
+def test_workflow_tool_use_is_recorded_with_run_id_and_dir(tmp_path):
+    from helpers import workflow_result_line, workflow_tool_use
+    lines = [assistant_line("m1", "claude-fable-5-1", usage(), content=[workflow_tool_use("tw1", "review PRs")]),
+             workflow_result_line("tw1", "wf_abc-123", name="review", transcript_dir="/x/y")]
+    t = parse_transcript(write_jsonl(tmp_path / "p.jsonl", lines))
+    (run,) = t.workflows
+    assert (run.run_id, run.name, run.description, run.transcript_dir, run.tool_use_id) == \
+        ("wf_abc-123", "review", "review PRs", "/x/y", "tw1")
+    assert t.spawns == [] and t.tool_calls == {"Workflow": 1}
+
+
+def test_tool_calls_title_cwd_and_cost_state_are_collected(tmp_path):
+    lines = [
+        {"type": "custom-title", "customTitle": "My session", "sessionId": "s"},
+        {"type": "cost-state", "totalCostUSD": 1.5, "modelUsage": {"claude-sonnet-5": {"costUSD": 1.5}}},
+        dict(assistant_line("m1", "claude-sonnet-5", usage(), content=[
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}},
+            {"type": "tool_use", "id": "t2", "name": "Read", "input": {}},
+            {"type": "tool_use", "id": "t3", "name": "Bash", "input": {}}]), cwd="/tmp/proj", gitBranch="main", version="2.1.0"),
+    ]
+    t = parse_transcript(write_jsonl(tmp_path / "p.jsonl", lines))
+    assert t.title == "My session" and t.cwd == "/tmp/proj" and t.git_branch == "main" and t.version == "2.1.0"
+    assert t.tool_calls == {"Bash": 2, "Read": 1}
+    assert t.reported_cost_usd == 1.5 and "claude-sonnet-5" in t.reported_model_usage
+
+
+def test_continued_session_marks_lines_carried_over_from_the_old_session(tmp_path):
+    old, new = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+    lines = [dict(assistant_line("m1", "claude-fable-5-1", usage(out=5)), sessionId=old),
+             dict(assistant_line("m2", "claude-fable-5-1", usage(out=5)), sessionId=new)]
+    t = parse_transcript(write_jsonl(tmp_path / f"{new}.jsonl", lines))
+    assert t.session_id == new and t.continued_from == [old]
+    assert [c.session_id for c in t.calls] == [old, new]
+
+
+def test_slash_commands_are_not_used_as_the_first_prompt(tmp_path):
+    lines = [{"type": "user", "message": {"role": "user", "content": "/model"}},
+             {"type": "user", "message": {"role": "user", "content": "Refactor the auth module please"}}]
+    assert parse_transcript(write_jsonl(tmp_path / "p.jsonl", lines)).first_prompt == "Refactor the auth module please"

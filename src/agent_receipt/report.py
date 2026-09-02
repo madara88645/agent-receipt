@@ -8,9 +8,20 @@ from dataclasses import asdict
 from .parse import Usage
 from .policy import Finding, Policy
 from .pricing import fmt_usd
-from .tree import AgentNode, failure_summary
+from .tree import AgentNode, carried_over, failure_summary
 
 _MAX_EXAMPLES_PER_RULE = 5
+
+
+def fmt_duration(ms: int | None) -> str:
+    if ms is None:
+        return "-"
+    s = ms // 1000
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
 def fmt_tokens(n: int) -> str:
@@ -60,6 +71,8 @@ def _model_column(node: AgentNode) -> str:
     models = node.models()
     if node.depth == 0:
         return ", ".join(f"{m} x{n}" for m, n in models.most_common()) or "-"
+    if node.kind == "workflow":
+        return f"{len(node.children)} agents" if node.children else "(no agent files)"
     if not node.has_transcript:
         return "(no transcript)"
     single = len(models) == 1 and (node.resolved_model is None or next(iter(models)) == node.resolved_model)
@@ -74,6 +87,13 @@ def _usage_cells(u: Usage, calls: int, cost: float | None) -> str:
             f"  write {fmt_tokens(u.cache_create):>6}  {fmt_usd(cost):>8}")
 
 
+def _activity_cells(node: AgentNode) -> str:
+    if node.kind == "workflow":
+        return ""
+    tools = node.tool_call_count
+    return f"  {fmt_duration(node.duration_ms):>7}  {(str(tools) + ' tools') if tools is not None else '-':>9}"
+
+
 def _tree_lines(node: AgentNode, flagged: set[str | None], policy: Policy, prefix: str = "", is_last: bool = True,
                 is_root: bool = True) -> list[str]:
     connector = "" if is_root else ("└── " if is_last else "├── ")
@@ -81,7 +101,7 @@ def _tree_lines(node: AgentNode, flagged: set[str | None], policy: Policy, prefi
     orphan = "  (parent unknown)" if not node.parent_known else ""
     desc = node.description if node.depth else "main session"
     line = (f"{prefix}{connector}{desc[:40]:<40} {node.subagent_type:<15} {_model_column(node):<44} "
-            f"{_usage_cells(node.usage(), len(node.calls), _cost_or_none(node, policy))}{mark}{orphan}")
+            f"{_usage_cells(node.usage(), len(node.calls), _cost_or_none(node, policy))}{_activity_cells(node)}{mark}{orphan}")
     lines = [line.rstrip()]
     child_prefix = "" if is_root else prefix + ("    " if is_last else "│   ")
     if node.failed_spawns:
@@ -92,6 +112,13 @@ def _tree_lines(node: AgentNode, flagged: set[str | None], policy: Policy, prefi
     for i, child in enumerate(node.children):
         lines += _tree_lines(child, flagged, policy, child_prefix, i == len(node.children) - 1, is_root=False)
     return lines
+
+
+def _delta_note(ours: float, theirs: float) -> str:
+    if theirs <= 0:
+        return ""
+    pct = (ours - theirs) / theirs * 100
+    return f" (our estimate {'+' if pct >= 0 else ''}{pct:.0f}%)"
 
 
 def _cost_or_none(node: AgentNode, policy: Policy) -> float | None:
@@ -132,7 +159,27 @@ def render_text(root: AgentNode, findings: list[Finding], policy: Policy, sessio
     cost, unpriced = session_cost(nodes, policy)
     sub_cost, _ = session_cost([n for n in nodes if n.depth], policy)
     unpriced_note = f" ({unpriced} calls on unpriced models)" if unpriced else ""
-    out.append(f"Estimated cost: {fmt_usd(cost)} · subagents {fmt_usd(sub_cost)}{unpriced_note}")
+    main_cost = cost - sub_cost
+    ratio = f" ({sub_cost / main_cost:.1f}x the main session)" if main_cost > 0 and sub_cost > 0 else ""
+    out.append(f"Estimated cost: {fmt_usd(cost)} · main session {fmt_usd(main_cost)} · subagents {fmt_usd(sub_cost)}{ratio}{unpriced_note}")
+    inherited_calls, inherited_children = carried_over(root)
+    if root.continued_from:
+        inherited = Usage()
+        for c in inherited_calls:
+            inherited = inherited + c.usage
+        inh_cost = sum((policy.cost_of(c.model, c.usage) or 0.0) for c in inherited_calls)
+        inh_cost += sum(session_cost(list(ch.walk()), policy)[0] for ch in inherited_children)
+        out.append(f"Continues session {', '.join(s[:8] for s in root.continued_from)}: {len(inherited_calls)} calls, "
+                   f"{len(inherited_children)} agents and {fmt_usd(inh_cost)} above were carried over from it "
+                   f"(the digest counts them once)")
+    if root.reported_cost_usd is not None:
+        out.append(f"Claude Code's own figure for this session: {fmt_usd(root.reported_cost_usd)}"
+                   f"{_delta_note(cost, root.reported_cost_usd)}; per model, ours vs Claude Code:")
+        ours = _totals_by_model(nodes, policy)
+        for model, theirs in sorted(root.reported_model_usage.items(), key=lambda kv: -float(kv[1].get("costUSD") or 0)):
+            mine = ours.get(model, {}).get("cost")
+            note = "" if model in ours else "  (never appears in the transcripts)"
+            out.append(f"  {model:<28} {fmt_usd(mine if model in ours else 0.0):>9}  vs {fmt_usd(float(theirs.get('costUSD') or 0)):>9}{note}")
     out.append("")
     limit_agents = policy.max_agents or "none"
     failed_total = sum(len(n.failed_spawns) for n in nodes)
@@ -172,6 +219,12 @@ def _node_dict(node: AgentNode, policy: Policy) -> dict:
         "models": dict(node.models()),
         "usage": {"input": u.input, "cache_create": u.cache_create, "cache_read": u.cache_read, "output": u.output},
         "cost": _cost_or_none(node, policy),
+        "kind": node.kind,
+        "workflow_id": node.workflow_id,
+        "duration_ms": node.duration_ms,
+        "tool_calls": node.tool_call_count,
+        "tools": dict(node.tool_calls),
+        "tool_stats": node.tool_stats,
         "started": node.started,
         "ended": node.ended,
         "failed_spawns": [{"description": s.description, "subagent_type": s.subagent_type, "error": s.error}
@@ -190,6 +243,10 @@ def render_json(root: AgentNode, findings: list[Finding], policy: Policy, sessio
         "max_depth": max(n.depth for n in nodes),
         "failed_spawn_attempts": sum(len(n.failed_spawns) for n in nodes),
         "cost": cost,
+        "main_cost": cost - sub_cost,
+        "reported_cost": root.reported_cost_usd,
+        "reported_model_usage": root.reported_model_usage,
+        "continued_from": root.continued_from,
         "subagent_cost": sub_cost,
         "unpriced_calls": unpriced,
         "totals": _totals_by_model(nodes, policy),

@@ -105,3 +105,14 @@ def test_unresolved_spawn_finding_does_not_pretend_to_be_main():
     ghost = AgentNode(agent_id=None, depth=1, has_transcript=False, description="lost")
     (finding,) = evaluate(_root(ghost), Policy())
     assert finding.rule == "missing-transcript" and "main" not in finding.message
+
+
+def test_budget_rules_flag_expensive_agents_and_sessions():
+    big = _node("big", model="claude-sonnet-5", n=1)
+    big.calls[0].usage = Usage(output=1_000_000)          # $10 on sonnet-5
+    small = _node("small")
+    assert _rules(evaluate(_root(big, small), Policy())) == []
+    findings = evaluate(_root(big, small), Policy(max_agent_cost=5, max_session_cost=1))
+    assert _rules(findings) == ["over-budget", "over-budget"]
+    assert findings[0].agent_id == "big" and "$10.00" in findings[0].message
+    assert findings[1].agent_id is None and "session cost" in findings[1].message

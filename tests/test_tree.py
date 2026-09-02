@@ -151,3 +151,40 @@ def test_fork_copies_of_the_parents_failed_attempts_stay_on_the_parent(tmp_path)
     (fn,) = pn.children
     assert len(pn.failed_spawns) == 1 and fn.failed_spawns == []
     assert root.subtree_agents() == 2
+
+
+def test_workflow_run_becomes_a_container_whose_agents_can_spawn_children(tmp_path):
+    from helpers import workflow_result_line, workflow_tool_use
+    from agent_receipt.parse import WorkflowRun
+    main = parse_transcript(write_jsonl(tmp_path / "main.jsonl", [
+        assistant_line("m1", "claude-fable-5-1", usage(out=10), content=[workflow_tool_use("tw1", "review")]),
+        workflow_result_line("tw1", "wf_1", name="review")]))
+    (run,) = main.workflows
+    w1 = _sub(tmp_path, "w1", extra_lines=[
+        assistant_line("w1-s", "claude-sonnet-5", usage(), agent_id="w1", content=[agent_tool_use("tuA", "helper")]),
+        agent_result_line("tuA", "aaa", resolved_model="claude-sonnet-5", agent_id="w1")])
+    w2 = _sub(tmp_path, "w2", model="claude-opus-5")
+    a = _sub(tmp_path, "aaa")
+    root = build_tree(main, [a], workflows=[(run, [(w1, {"agentType": "workflow-subagent", "model": "sonnet"}), (w2, {})])])
+    (wf,) = root.children
+    assert (wf.kind, wf.agent_id, wf.subagent_type, wf.depth) == ("workflow", "wf_1", "workflow", 1)
+    assert [c.agent_id for c in wf.children] == ["w1", "w2"]
+    assert wf.children[0].requested_model == "sonnet" and wf.children[0].kind == "workflow-agent" and wf.children[0].depth == 1
+    assert [c.agent_id for c in wf.children[0].children] == ["aaa"]
+    assert root.subtree_agents() == 3            # the workflow container is not an agent
+    assert wf.children[1].models() == {"claude-opus-5": 2}
+
+
+def test_duration_and_tool_count_prefer_the_launcher_report_then_fall_back_to_the_transcript(tmp_path):
+    main = parse_transcript(write_jsonl(tmp_path / "main.jsonl", [
+        assistant_line("m1", "claude-fable-5-1", usage(), content=[agent_tool_use("tu1", "A"), agent_tool_use("tu2", "B")]),
+        agent_result_line("tu1", "aaa", resolved_model="claude-sonnet-5", finished=dict(duration_ms=9000, tool_calls=3)),
+        agent_result_line("tu2", "bbb", resolved_model="claude-sonnet-5")]))
+    a = _sub(tmp_path, "aaa")
+    b = _sub(tmp_path, "bbb", extra_lines=[
+        assistant_line("bbb-t", "claude-sonnet-5", usage(), agent_id="bbb", ts="2026-09-01T18:02:30.000Z",
+                       content=[{"type": "tool_use", "id": "x", "name": "Read", "input": {}}])])
+    root = build_tree(main, [a, b])
+    an, bn = root.children
+    assert (an.duration_ms, an.tool_call_count) == (9000, 3)
+    assert bn.duration_ms == 150_000 and bn.tool_call_count == 1
