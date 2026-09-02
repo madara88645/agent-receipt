@@ -10,7 +10,8 @@ from .parse import parse_transcript
 from .policy import evaluate, load_policy
 from .report import render_json, render_text, session_cost
 from .pricing import fmt_usd
-from .session import DEFAULT_CLAUDE_HOME, resolve_session, session_files
+from .parse import Transcript
+from .session import DEFAULT_CLAUDE_HOME, SessionFiles, find_agent_transcript, resolve_session, session_files
 from .tree import build_tree
 
 
@@ -36,6 +37,24 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def load_session(files: SessionFiles) -> tuple[Transcript, list[Transcript]]:
+    """Parse the main transcript and every subagent it (transitively) spawned, following
+    children whose files live under a sibling session directory."""
+    main = parse_transcript(files.main)
+    subagents = [parse_transcript(p) for p in files.subagents]
+    known = {t.agent_id for t in subagents if t.agent_id}
+    while True:
+        wanted = {s.child_agent_id for t in [main, *subagents] for s in t.spawns
+                  if s.child_agent_id and s.error is None} - known
+        found = [(aid, find_agent_transcript(files.main, aid)) for aid in sorted(wanted)]
+        found = [(aid, p) for aid, p in found if p is not None]
+        if not found:
+            return main, subagents
+        for aid, path in found:
+            known.add(aid)
+            subagents.append(parse_transcript(path))
+
+
 HOOK_CONFIG = {"hooks": {"SessionEnd": [{"hooks": [{"type": "command", "command": "agent-receipt --hook"}]}]}}
 
 
@@ -46,7 +65,7 @@ def run_hook(args, stdin) -> int:
         main_path = Path(payload["transcript_path"])
         policy = load_policy(args.policy)
         files = session_files(main_path)
-        root = build_tree(parse_transcript(files.main), [parse_transcript(p) for p in files.subagents])
+        root = build_tree(*load_session(files))
         findings = evaluate(root, policy)
         out_dir = Path(args.claude_home) / "agent-receipt"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     files = session_files(main_path)
-    root = build_tree(parse_transcript(files.main), [parse_transcript(p) for p in files.subagents])
+    root = build_tree(*load_session(files))
     findings = evaluate(root, policy)
     render = render_json if args.json else render_text
     sys.stdout.write(render(root, findings, policy, session_label=files.session_id))

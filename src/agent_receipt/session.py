@@ -59,6 +59,15 @@ def session_files(main: Path) -> SessionFiles:
     return SessionFiles(session_id=main.stem, main=main, subagents=subagents)
 
 
+def find_agent_transcript(main: Path, agent_id: str) -> Path | None:
+    """A resumed or continued session keeps its old id's directory for subagents it already
+    launched, so a child file can sit under a sibling session directory of the same project."""
+    for candidate in sorted(Path(main).parent.glob(f"*/subagents/agent-{agent_id}.jsonl")):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def resolve_session(arg: str | None, cwd: str | Path, claude_home: Path = DEFAULT_CLAUDE_HOME) -> Path:
     if arg:
         as_path = Path(arg).expanduser()

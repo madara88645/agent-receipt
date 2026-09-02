@@ -72,3 +72,23 @@ def test_print_hook_config_is_valid_json(capsys):
     assert main(["--print-hook-config"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["hooks"]["SessionEnd"][0]["hooks"][0]["command"] == "agent-receipt --hook"
+
+
+def test_child_transcript_under_a_sibling_session_dir_is_found(tmp_path, capsys):
+    """A continued session keeps spawning into the previous session id's directory."""
+    new_sid, old_sid = "22222222-2222-2222-2222-222222222222", "11111111-1111-1111-1111-111111111111"
+    write_jsonl(tmp_path / f"{new_sid}.jsonl", [
+        assistant_line("m1", "claude-fable-5-1", usage(out=10), content=[agent_tool_use("tu1", "worker", model="sonnet")]),
+        agent_result_line("tu1", "child001", resolved_model="claude-sonnet-5")])
+    write_jsonl(tmp_path / old_sid / "subagents" / "agent-child001.jsonl",
+                [assistant_line("c1", "claude-sonnet-5", usage(out=5), agent_id="child001",
+                                content=[agent_tool_use("tu2", "grandchild", model="sonnet")]),
+                 agent_result_line("tu2", "child002", resolved_model="claude-sonnet-5", agent_id="child001")])
+    write_jsonl(tmp_path / old_sid / "subagents" / "agent-child002.jsonl",
+                [assistant_line("g1", "claude-sonnet-5", usage(out=5), agent_id="child002")])
+    main([str(tmp_path / f"{new_sid}.jsonl"), "--json", "--no-fail"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["agents"] == 2
+    (child,) = data["tree"]["children"]
+    assert child["has_transcript"] and child["children"][0]["has_transcript"]
+    assert not any(f["rule"] == "missing-transcript" for f in data["findings"])
