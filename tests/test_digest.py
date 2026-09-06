@@ -44,7 +44,9 @@ def test_digest_json_and_since_filter(tmp_path, capsys):
     os.utime(old, (time.time() - 40 * 86400, time.time() - 40 * 86400))
     _session(tmp_path, "proj-a", "cccc3333", "2026-09-02T10:00:00.000Z")
     assert main(["--since", "7d", "--json", "--claude-home", str(tmp_path)]) == 0
-    data = json.loads(capsys.readouterr().out)
+    out = capsys.readouterr().out
+    assert out.endswith("}\n")
+    data = json.loads(out)
     assert [s["session"] for s in data["sessions"]] == ["cccc3333"]
     assert data["agents"] == 1 and data["total_cost"] > data["subagent_cost"] > 0
 
