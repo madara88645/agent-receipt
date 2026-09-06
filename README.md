@@ -27,6 +27,7 @@ agent-receipt --since 7d       # one table for every session touched this week, 
 agent-receipt --all            # the same for everything on disk
 agent-receipt --json           # machine-readable, both modes
 agent-receipt --policy my.toml # your own rules and budgets
+agent-receipt --no-fail        # report findings but always exit 0
 ```
 
 Exit code is `1` when there are findings, `0` otherwise, `2` on usage errors.
@@ -73,6 +74,9 @@ max_agents = 0            # 0 = no limit
 max_agent_cost = 0.0      # USD, 0 = no limit
 max_session_cost = 0.0
 flag_failed_spawns = true
+flag_model_switch = true
+flag_resolved_mismatch = true
+flag_missing_transcript = true
 
 [prices."claude-sonnet-5*"]      # USD per million tokens, fnmatch pattern
 input = 2
@@ -90,7 +94,7 @@ Dollar figures are list-price estimates and a lower bound: Claude Code also make
 ## Develop
 
 ```bash
-uv run pytest -q                       # 76 tests on synthetic transcripts
+uv run pytest -q                       # 88 tests on synthetic transcripts
 uv run python scripts/corpus_check.py  # anonymous statistics over your own sessions
 ```
 
