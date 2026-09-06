@@ -90,6 +90,39 @@ def test_load_policy_without_path_returns_defaults():
     assert load_policy(None) == Policy()
 
 
+@pytest.mark.parametrize("body, match", [
+    ('max_depth = "two"', "max_depth"),
+    ("max_depth = true", "max_depth"),
+    ('max_agent_cost = "1"', "max_agent_cost"),
+    ("flag_failed_spawns = 1", "flag_failed_spawns"),
+    ('cheap_models = "claude-sonnet-5"', "cheap_models"),
+    ("cheap_models = [1, 2]", r"cheap_models\[0\]"),
+    ("prices = 5", "prices"),
+    ('[prices."claude-opus-*"]\ninput = "abc"', "input"),
+    ('[prices."claude-opus-*"]\ncache_writes = 1', "cache_writes"),
+])
+def test_load_policy_rejects_wrongly_typed_values(tmp_path, body, match):
+    """A hand-written policy file used to crash deep inside a rule instead of exiting 2."""
+    p = tmp_path / "policy.toml"
+    p.write_text(body + "\n")
+    with pytest.raises(ValueError, match=match):
+        load_policy(p)
+
+
+def test_workflow_container_findings_keep_the_whole_run_id():
+    wf = AgentNode(agent_id="wf_run-12345678", depth=1, kind="workflow", has_transcript=False)
+    (finding,) = evaluate(_root(wf), Policy())
+    assert "wf_run-12345678" in finding.message
+
+
+def test_budget_findings_do_not_round_small_amounts_to_zero():
+    node = _node("a", model="claude-sonnet-5", n=1)
+    node.calls[0].usage = Usage(output=1_000)             # $0.01 on sonnet-5
+    findings = evaluate(_root(node), Policy(max_agent_cost=0.001))
+    assert [f.rule for f in findings] == ["over-budget"]
+    assert "$0.010" in findings[0].message and "$0.001" in findings[0].message
+
+
 def test_failed_spawns_are_flagged_with_count_and_reason():
     from agent_receipt.parse import Spawn
     node = _node("p")
