@@ -134,4 +134,4 @@ def render_digest_json(rows: list[SessionRow], policy: Policy, label: str) -> st
         "agents": sum(r.agents for r in rows),
         "findings_by_rule": dict(Counter(f.rule for r in rows for f in r.findings)),
     }
-    return json.dumps(data, indent=2)
+    return json.dumps(data, indent=2) + "\n"

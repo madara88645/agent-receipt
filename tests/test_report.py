@@ -30,6 +30,11 @@ FINDINGS = [Finding("heavy-model", "ffff2222cccc", "ffff2222: 1 calls on claude-
 
 def test_fmt_tokens_is_compact():
     assert [fmt_tokens(n) for n in (0, 999, 1000, 45120685, 2194838)] == ["0", "999", "1.0k", "45.1M", "2.2M"]
+    assert [fmt_tokens(n) for n in (10**9, 4 * 10**12)] == ["1.0B", "4000.0B"]
+
+
+def test_json_output_ends_with_a_newline():
+    assert render_json(_tree(), FINDINGS, Policy(), session_label="s").endswith("}\n")
 
 
 def test_text_report_shows_tree_models_totals_and_findings():

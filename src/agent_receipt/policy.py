@@ -7,7 +7,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from .parse import Usage
-from .pricing import Price, price_for
+from .pricing import Price, fmt_usd, price_for
 from .tree import AgentNode, failure_summary
 
 
@@ -42,21 +42,62 @@ class Finding:
     message: str
 
 
+_VALUE_TYPES: dict[str, tuple[type, ...]] = {
+    "cheap_models": (list,),
+    "max_depth": (int,),
+    "max_agents": (int,),
+    "flag_model_switch": (bool,),
+    "flag_resolved_mismatch": (bool,),
+    "flag_missing_transcript": (bool,),
+    "flag_failed_spawns": (bool,),
+    "prices": (dict,),
+    "max_agent_cost": (int, float),
+    "max_session_cost": (int, float),
+}
+_PRICE_KEYS = ("input", "cache_write", "cache_read", "output")
+
+
+def _check_type(key: str, value: object, expected: tuple[type, ...]) -> None:
+    """A policy file is hand-written, so a wrong type is a usage error, not a crash."""
+    wants_bool = expected == (bool,)
+    if isinstance(value, bool) != wants_bool or not isinstance(value, expected):
+        names = " or ".join(t.__name__ for t in expected)
+        raise ValueError(f"key {key!r} must be {names}, got {type(value).__name__}")
+
+
+def _check(raw: dict) -> None:
+    known = {f.name for f in fields(Policy)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"unknown policy key(s): {', '.join(unknown)}; known keys: {', '.join(sorted(known))}")
+    for key, value in raw.items():
+        _check_type(key, value, _VALUE_TYPES[key])
+    for i, pattern in enumerate(raw.get("cheap_models", [])):
+        _check_type(f"cheap_models[{i}]", pattern, (str,))
+    for pattern, table in raw.get("prices", {}).items():
+        _check_type(f'prices."{pattern}"', table, (dict,))
+        for key, value in table.items():
+            if key not in _PRICE_KEYS:
+                raise ValueError(f'unknown key {key!r} in [prices."{pattern}"]; '
+                                 f"known keys: {', '.join(_PRICE_KEYS)}")
+            _check_type(f'prices."{pattern}".{key}', value, (int, float))
+
+
 def load_policy(path: Path | str | None) -> Policy:
     if path is None:
         return Policy()
     with Path(path).open("rb") as fh:
         raw = tomllib.load(fh)
-    known = {f.name for f in fields(Policy)}
-    unknown = sorted(set(raw) - known)
-    if unknown:
-        raise ValueError(f"unknown policy key(s): {', '.join(unknown)}; known keys: {', '.join(sorted(known))}")
+    _check(raw)
     return Policy(**raw)
 
 
 def _label(node: AgentNode) -> str:
     if node.agent_id:
-        return node.agent_id[:8]
+        # agent ids are long opaque handles and are cut down for readability; a workflow
+        # container is identified by its run id, which has to stay whole to be matched
+        # against the run directory on disk
+        return node.agent_id if node.kind == "workflow" else node.agent_id[:8]
     return "main" if node.depth == 0 else f"({node.description})"
 
 
@@ -110,13 +151,14 @@ def evaluate(root: AgentNode, policy: Policy) -> list[Finding]:
             if cost > policy.max_agent_cost:
                 findings.append(Finding(
                     "over-budget", node.agent_id,
-                    f"{_label(node)}: cost ${cost:.2f} exceeds the per-agent budget of ${policy.max_agent_cost:.2f}"))
+                    f"{_label(node)}: cost {fmt_usd(cost)} exceeds the per-agent budget of "
+                    f"{fmt_usd(policy.max_agent_cost)}"))
     if policy.max_session_cost:
         session = sum((policy.cost_of(c.model, c.usage) or 0.0) for n in root.walk() for c in n.calls)
         if session > policy.max_session_cost:
             findings.append(Finding(
                 "over-budget", None,
-                f"session cost ${session:.2f} exceeds the budget of ${policy.max_session_cost:.2f}"))
+                f"session cost {fmt_usd(session)} exceeds the budget of {fmt_usd(policy.max_session_cost)}"))
     total = root.subtree_agents()
     if policy.max_agents and total > policy.max_agents:
         findings.append(Finding(

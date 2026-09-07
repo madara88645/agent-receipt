@@ -29,7 +29,9 @@ def fmt_tokens(n: int) -> str:
         return str(n)
     if n < 1_000_000:
         return f"{n / 1_000:.1f}k"
-    return f"{n / 1_000_000:.1f}M"
+    if n < 1_000_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{n / 1_000_000_000:.1f}B"
 
 
 def node_cost(node: AgentNode, policy: Policy) -> tuple[float, int]:
@@ -255,4 +257,4 @@ def render_json(root: AgentNode, findings: list[Finding], policy: Policy, sessio
         "policy": asdict(policy),
         "tree": _node_dict(root, policy),
     }
-    return json.dumps(data, indent=2)
+    return json.dumps(data, indent=2) + "\n"
